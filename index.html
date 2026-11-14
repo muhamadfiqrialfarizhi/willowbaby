@@ -478,6 +478,7 @@
     <div class="ptabs">
       <button class="ptab active" data-p="stock">📦 Kelola Stok</button>
       <button class="ptab" data-p="add">➕ Tambah Produk</button>
+      <button class="ptab" data-p="orders">🧾 Pesanan</button>
     </div>
     <div class="pbody">
       <div class="demo-note" id="demoNote" hidden>
@@ -494,6 +495,16 @@
         </div>
         <div class="form-actions" id="seedBox" hidden>
           <button class="btn btn-outline btn-sm" id="seedBtn">Muat produk contoh</button>
+        </div>
+      </div>
+
+      <!-- Pesanan -->
+      <div id="pOrders" hidden>
+        <div class="table-wrap">
+          <table class="stock-table">
+            <thead><tr><th>Waktu</th><th>Pembeli</th><th>Barang</th><th>Total</th></tr></thead>
+            <tbody id="ordersBody"></tbody>
+          </table>
         </div>
       </div>
 
@@ -577,13 +588,14 @@ function toast(msg){
 
 /* ====== STATE ====== */
 let products = [];
-let cart = JSON.parse(localStorage.getItem("willowCart") || "[]");
+let cart = [];
 let favs = new Set();
 let filter = "all";
 let user = null;
 const isAdmin = () => !!user && ADMIN_EMAILS.map(e=>e.toLowerCase()).includes((user.email||"").toLowerCase());
 const FIREBASE_READY = !firebaseConfig.apiKey.startsWith("ISI_");
 let firebaseOK = false, dbEmpty = false, seeding = false;
+let ordersUnsub = null, orders = [];
 
 /* =====================================================================
    LAYER DATA & AUTH  (Firebase  ATAU  mode demo localStorage)
@@ -612,7 +624,28 @@ if (FIREBASE_READY) { try {
     add: p => F.addDoc(col, {...p, createdAt: Date.now()}),
     setStock: (id, n) => F.updateDoc(F.doc(db,"products",id), {stock:n}),
     remove: id => F.deleteDoc(F.doc(db,"products",id)),
-    seed: async () => { let i=0; for(const p of DEFAULT_PRODUCTS) await F.addDoc(col, {...p, createdAt: Date.now()+(i++)}); }
+    seed: async () => { let i=0; for(const p of DEFAULT_PRODUCTS) await F.addDoc(col, {...p, createdAt: Date.now()+(i++)}); },
+    // Checkout: cek stok, kurangi stok, dan catat pesanan dalam satu transaksi (atomik)
+    checkout: async (items, u, total) => {
+      await F.runTransaction(db, async tx => {
+        const refs = items.map(i => F.doc(db, "products", i.id));
+        const snaps = await Promise.all(refs.map(r => tx.get(r)));
+        snaps.forEach((s,k)=>{
+          if(!s.exists()) throw new Error("Produk tidak ditemukan: " + items[k].name);
+          const st = Number(s.data().stock)||0;
+          if(st < items[k].qty) throw new Error("Stok " + items[k].name + " tidak cukup (sisa " + st + ")");
+        });
+        snaps.forEach((s,k)=> tx.update(refs[k], {stock: (Number(s.data().stock)||0) - items[k].qty}));
+        tx.set(F.doc(F.collection(db, "orders")), {
+          email: u.email, name: u.name, total, status: "baru", createdAt: Date.now(),
+          items: items.map(i=>({id:i.id, name:i.name, qty:i.qty, price:i.price}))
+        });
+      });
+    },
+    subscribeOrders: cb => F.onSnapshot(
+      F.query(F.collection(db, "orders"), F.orderBy("createdAt","desc"), F.limit(50)),
+      snap => cb(snap.docs.map(d => ({id:d.id, ...d.data()}))),
+      err => console.error(err))
   };
   firebaseOK = true;
   } catch(err){
@@ -628,13 +661,28 @@ if (!firebaseOK) {
     return DEFAULT_PRODUCTS.map((p,i)=>({...p, id:"d"+(i+1)}));
   };
   let list = read(); const subs = [];
+  const OLS = "willowOrdersDemo"; const osubs = [];
+  let dOrders = []; try { dOrders = JSON.parse(localStorage.getItem(OLS)) || []; } catch(e){}
   const commit = () => { localStorage.setItem(LS, JSON.stringify(list)); subs.forEach(f=>f([...list])); };
   store = {
     subscribe: cb => { subs.push(cb); cb([...list]); return ()=>{}; },
     add: async p => { list.push({...p, id:"d"+Date.now()}); commit(); },
     setStock: async (id,n) => { const p=list.find(x=>x.id===id); if(p){p.stock=n; commit();} },
     remove: async id => { list = list.filter(x=>x.id!==id); commit(); },
-    seed: async () => { list = DEFAULT_PRODUCTS.map((p,i)=>({...p,id:"d"+(i+1)})); commit(); }
+    seed: async () => { list = DEFAULT_PRODUCTS.map((p,i)=>({...p,id:"d"+(i+1)})); commit(); },
+    checkout: async (items, u, total) => {
+      items.forEach(i=>{
+        const p = list.find(x=>x.id===i.id);
+        if(!p) throw new Error("Produk tidak ditemukan: " + i.name);
+        if((Number(p.stock)||0) < i.qty) throw new Error("Stok " + i.name + " tidak cukup (sisa " + (Number(p.stock)||0) + ")");
+      });
+      items.forEach(i=>{ const p = list.find(x=>x.id===i.id); p.stock = (Number(p.stock)||0) - i.qty; });
+      dOrders.unshift({id:"o"+Date.now(), email:u.email, name:u.name, total, status:"baru", createdAt:Date.now(),
+        items: items.map(i=>({id:i.id, name:i.name, qty:i.qty, price:i.price}))});
+      localStorage.setItem(OLS, JSON.stringify(dOrders));
+      commit(); osubs.forEach(f=>f([...dOrders]));
+    },
+    subscribeOrders: cb => { osubs.push(cb); cb([...dOrders]); return ()=>{}; }
   };
   const cbs = [];
   const cur = () => { try { return JSON.parse(localStorage.getItem("willowUserDemo")); } catch(e){ return null; } };
@@ -721,7 +769,10 @@ grid.addEventListener("click", e=>{
 
 /* ====== CART ====== */
 const drawer = $("drawer"), overlay = $("overlay"), cartItems = $("cartItems");
-function saveCart(){ localStorage.setItem("willowCart", JSON.stringify(cart)); renderCart(); }
+// Keranjang disimpan per akun, jadi ganti akun = keranjang akun itu sendiri
+function cartKey(){ return "willowCart:" + ((user && user.email) || "guest"); }
+function loadCart(){ try { cart = JSON.parse(localStorage.getItem(cartKey()) || "[]"); } catch(e){ cart = []; } }
+function saveCart(){ try { localStorage.setItem(cartKey(), JSON.stringify(cart)); } catch(e){} renderCart(); }
 function renderCart(){
   // buang item yang produknya sudah dihapus / melebihi stok
   if(products.length){
@@ -767,15 +818,53 @@ $("cartBtn").onclick = openCart;
 $("closeCart").onclick = closeCart;
 overlay.onclick = closeCart;
 
-$("checkout").addEventListener("click", e=>{
+let checkingOut = false;
+$("checkout").addEventListener("click", async e=>{
   e.preventDefault();
+  if(checkingOut) return;
   if(!cart.length) return toast("Keranjang masih kosong");
-  let total = 0;
-  const lines = cart.map(c=>{const p=products.find(x=>x.id===c.id);total+=p.price*c.qty;return `- ${p.name} x${c.qty} = ${rupiah(p.price*c.qty)}`});
-  const who = user ? `\nNama: ${user.name}\nEmail: ${user.email}\n` : "";
-  const msg = `Halo Willow Baby Shop, saya ingin memesan:\n${lines.join("\n")}\n\nTotal: ${rupiah(total)}${who}`;
-  window.open(`https://wa.me/${WA}?text=${encodeURIComponent(msg)}`,"_blank");
+  if(!user){ toast("Masuk dengan Google dulu untuk checkout"); closeCart(); $("loginBtn").click(); return; }
+  const items = cart.map(c=>{
+    const p = products.find(x=>x.id===c.id);
+    return p ? {id:p.id, name:p.name, price:p.price, qty:c.qty} : null;
+  }).filter(Boolean);
+  if(!items.length) return toast("Keranjang masih kosong");
+  if(items.some(i=>String(i.id).startsWith("default"))) return toast("Produk belum siap di database. Hubungi admin.");
+  const total = items.reduce((s,i)=>s+i.price*i.qty, 0);
+  checkingOut = true;
+  const w = window.open("about:blank", "_blank");   // dibuka dulu agar tidak diblokir popup-blocker
+  try {
+    await store.checkout(items, user, total);        // stok berkurang + pesanan tercatat
+    cart = []; saveCart(); closeCart();
+    const lines = items.map(i=>`- ${i.name} x${i.qty} = ${rupiah(i.price*i.qty)}`);
+    const msg = `Halo Willow Baby Shop, saya ingin memesan:\n${lines.join("\n")}\n\nTotal: ${rupiah(total)}\n\nNama: ${user.name}\nEmail: ${user.email}`;
+    const url = `https://wa.me/${WA}?text=${encodeURIComponent(msg)}`;
+    if(w) w.location.href = url; else window.location.href = url;
+    toast("Pesanan dibuat, stok diperbarui ✅");
+  } catch(err){
+    if(w) w.close();
+    console.error(err);
+    toast(err.code==="permission-denied" ? "Ditolak server. Periksa Firestore Rules." : (err.message || "Checkout gagal"));
+  } finally { checkingOut = false; }
 });
+
+/* ====== PESANAN (khusus admin) ====== */
+function syncOrders(){
+  if(ordersUnsub){ ordersUnsub(); ordersUnsub = null; }
+  orders = [];
+  if(isAdmin()) ordersUnsub = store.subscribeOrders(list=>{ orders = list; renderOrders(); });
+  renderOrders();
+}
+function renderOrders(){
+  const el = $("ordersBody"); if(!el) return;
+  el.innerHTML = orders.length ? orders.map(o=>`
+    <tr>
+      <td>${esc(new Date(o.createdAt).toLocaleString("id-ID"))}</td>
+      <td><b>${esc(o.name)}</b><small style="display:block;color:var(--muted)">${esc(o.email)}</small></td>
+      <td>${(o.items||[]).map(i=>esc(i.name)+" ×"+(Number(i.qty)||0)).join("<br>")}</td>
+      <td>${rupiah(o.total)}</td>
+    </tr>`).join("") : '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:30px">Belum ada pesanan.</td></tr>';
+}
 
 /* =====================================================================
    LOGIN / USER UI
@@ -808,7 +897,9 @@ auth.onChange(u=>{
   }
   $("adminHint").hidden = !u || isAdmin();
   if(!isAdmin()) closeAdmin();
+  loadCart(); renderCart();
   renderAdmin();
+  syncOrders();
   maybeSeed();
 });
 
@@ -833,6 +924,7 @@ document.querySelectorAll(".ptab").forEach(t=>t.addEventListener("click",()=>{
   document.querySelectorAll(".ptab").forEach(x=>x.classList.toggle("active", x===t));
   $("pStock").hidden = t.dataset.p!=="stock";
   $("pAdd").hidden = t.dataset.p!=="add";
+  $("pOrders").hidden = t.dataset.p!=="orders";
 }));
 
 function renderAdmin(){
