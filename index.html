@@ -494,7 +494,7 @@
   document.getElementById("checkout").addEventListener("click", e=>{
     e.preventDefault();
     if(!cart.length) return toast("Keranjang masih kosong");
-    const WA = "6281234567890";
+    const WA = "6282126147757";
     let total = 0;
     const lines = cart.map(c=>{const p=products.find(x=>x.id===c.id);total+=p.price*c.qty;return `- ${p.name} x${c.qty} = ${rupiah(p.price*c.qty)}`});
     const msg = `Halo Willow Baby Shop, saya ingin memesan:\n${lines.join("\n")}\n\nTotal: ${rupiah(total)}`;
